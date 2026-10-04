@@ -1,79 +1,75 @@
-# FlashAgent — pre-OS AI agent روی فلش (از صفر، بدون OS)
+# FlashAgent — Pre-OS Bare-Metal USB Agent
 
-FlashAgent یک ایجنت IT به‌صورت کامل از صفر (C خالص، ~1200 خط، static binary بدون
-هیچ کتابخانه خارجی) است که مستقیم از فلش USB با UEFI بوت می‌شود — **بدون هیچ
-سیستم‌عاملی روی ماشین هدف**. به LLM (plain HTTP) متصل است، tool call محلی اجرا
-می‌کند و کارهای واقعی انجام می‌دهد: شناسایی HW، خواندن/نوشتن تنظیمات UEFI NVRAM
-(لایهٔ واقعی «BIOS settings»)، کار با disk، framebuffer، شبکه، و plan نصب OS از
-ایزوهای روی فلش.
+A from-scratch, statically-linked C agent (~1,200 lines, no external libraries) that boots directly from a USB stick via UEFI — **with no operating system on the target machine**. It connects to a large language model over plain HTTP using a raw-socket client (no libcurl, no OpenSSL), runs local tool calls, and performs real hardware/firmware operations: enumerating components, reading/writing UEFI NVRAM settings (the real "BIOS settings" layer), interacting with disks, framebuffer, and the network, and preparing OS installs from ISOs stored on the stick.
 
-## مدارک verify شده (qemu q35 + OVMF + serial)
+## Verified in QEMU (q35 + OVMF + serial)
 
-- [x] GRUB (EFI) از ESP بوت می‌شود و منو/کنفیگ درست لود می‌شود
-- [x] kernel 5.15.0-139 + initramfs سفارشی (3.7 MB) بوت می‌شود
-- [x] `/init` (PID 1) اجرا می‌شود: proc/sys/devtmpfs/**efivarfs**، 34 ماژول
-- [x] پارتیشن دادهٔ فلش (ext4) mount می‌شود: `mounted USB data partition /dev/sda2`
-- [x] DHCP: `lease of 10.0.2.15 obtained` + IP/route اعمال شده
-- [x] **حلقهٔ agentic کامل درون VM**: user → LLM (HTTP) → tool_call `hw_scan` →
-      اجرای محلی روی HW واقعی VM (706 chars) → بازخورد به LLM → پاسخ نهایی
-- [x] خروج تمیز از agent + fallback به maintenance shell (بدون kernel panic)
+- [x] GRUB (EFI) boots from the ESP partition; menu and config load correctly
+- [x] Kernel `5.15.0-139` + custom initramfs (3.7 MB) boot correctly
+- [x] `/init` (PID 1) runs: `proc`/`sys`/`devtmpfs`/`efivarfs`, loads 34 kernel modules
+- [x] USB data partition (ext4) mounts: `mounted USB data partition /dev/sda2`
+- [x] DHCP lease applied: `lease of 10.0.2.15 obtained` + IP/route configured
+- [x] **Full agentic loop inside the VM**: user → LLM (HTTP) → tool call `hw_scan` → local execution on the VM's real hardware (706 chars) → response back to the LLM → final answer
+- [x] Clean agent exit with fallback to a maintenance shell — **no kernel panic**
 
-## معماری
+## Architecture
 
 ```
-فلش USB (GPT, ≥4GB)
+USB stick (GPT, >=4GB)
 ├── p1: 64M  ESP (FAT32)
-│   ├── EFI/BOOT/BOOTX64.EFI  GRUB (grub-mkimage, prefix=/EFI/BOOT)
-│   ├── EFI/BOOT/grub.cfg     منوی بوت
-│   ├── vmlinuz               kernel میزبان
-│   └── initrd                initramfs سفارشی (3.7 MB)
+│   ├── EFI/BOOT/BOOTX64.EFI   GRUB (grub-mkimage, prefix=/EFI/BOOT)
+│   ├── EFI/BOOT/grub.cfg      boot menu
+│   ├── vmlinuz                host kernel
+│   └── initrd                 custom initramfs (3.7 MB)
 └── p2: ext4  (FlashData)
     ├── flashagent.env        LLM_BASE / LLM_KEY / LLM_MODEL
-    └── *.iso                 ایزوهای نصب OS
+    └── *.iso                 OS install ISOs
 
-بوت: UEFI → GRUB → kernel → initramfs → /init → /flashagent (PID 1)
-اجرا: LLM (plain HTTP, raw socket) ↔ tool-calling loop ↔ ابزارهای محلی
+Boot: UEFI -> GRUB -> kernel -> initramfs -> /init -> /flashagent (PID 1)
+Run:  LLM (plain HTTP, raw socket) <-> tool-calling loop <-> local tools
 ```
 
-## ابزارهای ایجنت
+## Agent Tools
 
-| tool | کار |
+| tool | purpose |
 |---|---|
-| `hw_scan` | CPU/RAM/DMI/BIOS/GPU/USB از sysfs |
-| `disk_list` | diskها + پارتیشن‌ها (blockdev/sfdisk) |
-| `efi_vars` | خواندن/لیست UEFI NVRAM (مستقیم از efivarfs) |
-| `boot_entries` | خواندن/برچسب EFI boot entries |
-| `screen` | وضعیت framebuffer + thumbnail از /dev/fb0 |
-| `net` | status/ping/http |
-| `file_read`/`file_write` | دسترسی به فایل |
-| `run` | shell command با timeout |
-| `os_install` | plan نصب OS از ایزوهای فلش (autoinstall/unattend) |
+| `hw_scan` | CPU / RAM / DMI / BIOS / GPU / USB enumeration via sysfs |
+| `disk_list` | Disks and their partitions (blockdev / sfdisk) |
+| `efi_vars` | Read and list UEFI NVRAM directly from `efivarfs` |
+| `boot_entries` | Read and relabel EFI boot entries |
+| `screen` | Framebuffer status + thumbnail from `/dev/fb0` |
+| `net` | Link status, ping, HTTP |
+| `file_read` / `file_write` | File access |
+| `run` | Shell command with timeout |
+| `os_install` | Prepare an OS install plan from stick ISOs (autoinstall / unattend) |
 
-## ساخت
+## Building
 
 ```sh
 cd ~/bootable-agent/flashagent
 gcc -static -O2 -Wall -Wno-unused-function -o build/flashagent src/flashagent.c
 gcc -static -O2 -o build/insmod src/insmod.c
-bash build-usb-image.sh          # → flashagent-usb.img (512M)
+bash build-usb-image.sh          # -> flashagent-usb.img (512 MB)
 ```
 
-`build-usb-image.sh` خودکار: GRUB سفارشی (prefix درست)، kernel + initrd روی ESP،
-پارتیشن ext4 با `flashagent.env` و جای ایزو.
+`build-usb-image.sh` sets up a custom GRUB (with the correct prefix), copies the
+kernel and initramfs onto the ESP, and creates an ext4 data partition with
+`flashagent.env` and space for ISOs.
 
-## بوت روی فلش واقعی
+## Booting from a real USB stick
 
 ```sh
 sudo dd if=flashagent-usb.img of=/dev/sdX bs=4M oflag=direct status=progress
 ```
 
-قبل از بوت، LLM endpoint/key را در `flashagent.env` (روی p2) تنظیم کنید.
-agent روی tty0/serial مستقیم کار می‌کند؛ با `exit` به maintenance shell برمی‌گردد.
+Configure the LLM endpoint and key in `flashagent.env` on partition `p2` before
+booting. The agent runs directly on `tty0`/serial; type `exit` to drop to a
+maintenance shell.
 
-## تست در qemu
+## Testing in QEMU
 
 ```sh
-python3 build/mockllm.py &    # mock OpenAI روی :8977
+python3 build/mockllm.py &    # mock OpenAI API on port 8977
 cp /usr/share/OVMF/OVMF_VARS.fd build/ovmf-vars.fd
 qemu-system-x86_64 -machine q35 -cpu max -m 2048 -smp 2 \
   -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd \
@@ -81,65 +77,70 @@ qemu-system-x86_64 -machine q35 -cpu max -m 2048 -smp 2 \
   -drive file=flashagent-usb.img,if=ide,format=raw,cache=unsafe \
   -serial stdio -display none
 ```
-(LLM env در تصویر تست به `http://10.0.2.2:8977/v1` یعنی host از دید slirp NAT اشاره دارد.)
 
-## نکات فنی (pitfallها — از تست واقعی)
+(The test image points its LLM env at `http://10.0.2.2:8977/v1`, i.e. the QEMU
+host as seen from slirp NAT.)
 
-- **GRUB**: از `grub-mkimage -O x86_64-efi -p /EFI/BOOT` بسازید. تصویر monolithic
-  بستهٔ اوبونتو prefix اشتباه دارد و به prompt `grub>` می‌افتد.
-- **init**: باید در **سطح بالای cpio** با نام `./init` و permission 755 باشد
-  (و نه فقط `bin/init` که busybox است).
-- **udhcpc (busybox 1.30.1)**: reason اولیه `bound` است (نه `bind`)؛ متغیرهای
-  lease به‌صورت env با حروف کوچک (`ip`, `subnet`, `router`, `dns`) پاس داده
-  می‌شوند. script باید executable باشد.
-- **exFAT**: ساخت exFAT در این سیستم از FUSE انجام می‌شود و در-VM (درایwer
-  kernel) mount نمی‌شود → p2 را **ext4** بسازید (built-in kernel).
-- **ISO + OVMF**: درایور ISO9660 OVMF روی این qemu file system را attach نمی‌کرد؛
-  تصویر USB (GPT+ESP) مسیر قابل اعتمادتر و واقعی‌تر است.
-- **Auth HTTP**: header دقیقاً `Authorization: Bearer <key>` باشد (bug تکرار
-  پیشوند با `Authorization: Bearer ***`).
+## Technical Notes (from real-world testing)
 
-## محدودیت‌ها (صادقانه)
+- **GRUB**: build with `grub-mkimage -O x86_64-efi -p /EFI/BOOT`. The monolithic
+  image shipped with Ubuntu has the wrong prefix and drops to the `grub>` prompt.
+- **`/init`**: must be at the **top level** of the cpio archive as `./init` with
+  mode `755` — not only at `bin/init` (which busybox also provides).
+- **udhcpc (busybox 1.30.1)**: the initial reason is `bound`, not `bind`; lease
+  variables arrive as lowercase environment variables (`ip`, `subnet`, `router`,
+  `dns`). The script must be executable.
+- **exFAT**: an exFAT volume created on this host uses FUSE and will not mount in
+  the VM (the kernel driver rejects it) — so make `p2` **ext4**, which is built
+  into the kernel.
+- **ISO + OVMF**: the OVMF ISO9660 driver on this QEMU configuration would not
+  attach the ISO. A USB image with a GPT + ESP layout is the more reliable,
+  realistic path.
+- **HTTP auth**: the header must be exactly `Authorization: Bearer <key>` — do
+  not add a prefix such as `Authorization: Bearer Bearer ...`.
 
-- **Secure Boot**: با Secure Boot فعال، بوت custom block می‌شود.
-- **os_install**: planner/executor است (autoinstall/unattend درست می‌کند + boot
-  installer)؛ agent جایگزین installer کامل نیست.
-- **framebuffer در qemu بدون VGA واقعی**: ممکن است خالی بماند.
-- **key روی فلش**: فعلاً در `flashagent.env` پارتیشن داده (پیشنهاد: LUKS روی p2).
-- **LLM واقعی**: endpoint `http://157.66.255.8:4000/v1` (model `qwen3.8`) از
-  فلش باید قابل‌رس‌بسی باشد؛ key را در `flashagent.env` بگذارید. مکانیک با mock
-  کامل verify شده است.
+## Honest Limitations
 
-## فایل‌های کلیدی
+- **Secure Boot**: a custom boot chain is blocked when Secure Boot is enabled.
+- **`os_install`**: this is a planner/executor — it writes a correct
+  autoinstall/unattend script and boots the installer, but it is **not** a full
+  drop-in replacement for a complete installer.
+- **Framebuffer in QEMU**: without a real VGA adapter the framebuffer may be
+  empty.
+- **Key on the stick**: currently stored in plaintext in `flashagent.env` on the
+  data partition (recommended follow-up: LUKS on `p2`).
+- **Real LLM**: the endpoint `http://157.66.255.8:4000/v1` (model `qwen3.8`) must
+  be reachable from the stick. The key goes in `flashagent.env`. The full agentic
+  mechanism is verified end-to-end against a mock server.
 
-| فایل | توضیح |
+## Key Files
+
+| file | description |
 |---|---|
-| `flashagent-usb.img` | تصویر فلش بوت‌ابل 512M |
+| `flashagent-usb.img` | bootable 512 MB USB image |
 | `build/flashagent` | static agent binary (~1 MB) |
-| `src/flashagent.c` | سورس agent (~1200 خط) |
-| `src/insmod.c` | static module loader (finit_module) |
-| `root/init` | bootstrap پیش‌OS |
-| `build-usb-image.sh` | سازندهٔ تصویر |
-| `build/mockllm.py` | mock OpenAI برای تست |
-| `build/fa-boot.log` | log بوت verify شده |
+| `src/flashagent.c` | agent source (~1,200 lines) |
+| `src/insmod.c` | static module loader (`finit_module`) |
+| `root/init` | pre-OS bootstrap script |
+| `build-usb-image.sh` | image builder |
+| `build/mockllm.py` | mock OpenAI server for testing |
+| `build/fa-boot.log` | verified boot log |
 
 ---
 
-## دربارهٔ ما
+## About
 
-FlashAgent پروژه‌ای از **کیان هوش** (Kiyan Hoosh) است؛ شرکت توسعه‌دهندهٔ
-ایجنت‌های هوشمند برای کسب‌وکارها. این پروژه آزاد منتشر می‌شود تا در دنیای
-توسعه‌دهندگان به اشتراک گذاشته شود.
+FlashAgent is a project from **Kiyan Hoosh** (Kiyan Hoesh AI Computing), a
+company that builds AI agents for businesses. It is published open so that the
+developer community can build on it.
 
-- وبسایت: [housheyar.ir](https://housheyar.ir)
-- سایت مادر شرکت: [kiyanhoosh.ir](https://kiyanhoosh.ir)
+- Website: [housheyar.ir](https://housheyar.ir)
+- Parent company: [kiyanhoosh.ir](https://kiyanhoosh.ir)
 
----
+The repository contains the clean source only — no secret files, no binary, and
+no built image (those contain a live API key and are intentionally excluded for
+security reasons).
 
-محتوای این ریپو (سورسِ تمیز — بدون فایل کلید): README، `src/`، `root/init`،
-ابزارهای ساخت. فایل‌های حاوی کلید/API، binary، و تصویر فلش ساخته‌شده
-عمداً در ریپو قرار گرفته نشده‌اند (علت امنیتی).
+## License
 
-## مجوز
-
-MIT License
+MIT
