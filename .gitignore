@@ -1,0 +1,27 @@
+# Secret files — NEVER commit (contain live API key)
+*.img
+*.iso
+*.cgz
+*.fd
+.env
+.gh_token
+flashagent.env
+
+# Binary agent + built artifacts
+build/flashagent
+build/flashagent-dbg
+build/static_test
+build/vmlinuz
+build/grub/grubx64.efi
+build/mockllm.py
+build/*.log
+build/initrd-real/
+minitest/
+
+# Pre-built rootfs binaries (host-specific) — source is root/init
+root/initramfs/
+iso/build/
+
+# Python cache
+__pycache__/
+*.pyc

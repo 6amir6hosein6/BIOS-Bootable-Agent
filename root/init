@@ -1,0 +1,120 @@
+#!/bin/sh
+# FlashAgent init — pre-OS environment bootstrap (PID 1)
+# No OS on the target: mount corefs, load storage/net/HID modules,
+# bring up DHCP, load LLM config, exec the agent on the console.
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+# --- core filesystems ---
+mount -t proc none /proc 2>/dev/null
+mount -t sysfs none /sys 2>/dev/null
+mount -t tmpfs none /tmp 2>/dev/null
+if [ ! -e /dev/console ]; then mknod -m 600 /dev/console c 5 1 2>/dev/null; fi
+mount -t devtmpfs none /dev 2>/dev/null
+# UEFI NVRAM (the "BIOS settings" layer)
+if [ -d /sys/firmware/efi ]; then
+  mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null
+fi
+
+# --- modules (dependency-ordered; failures are non-fatal) ---
+K=$(uname -r)
+if [ -f /etc/modorder ]; then
+  while IFS='	' read -r base rest; do
+    [ -z "$base" ] && continue
+    f=/lib/modules/$K/$base.ko
+    [ -f "$f" ] || continue
+    /sbin/insmod "$f" 2>/dev/null || true
+  done < /etc/modorder
+fi
+sleep 1
+
+# --- USB stick / Ventoy partition (ISOs + env overrides) ---
+# Scan every real block device (any bus: sda*, nvme*n1p*, vda*, mmcblk*),
+# try to mount each partition; keep the first one that looks like data
+# (has flashagent.env or an .iso). Real hardware enumerates USB slower than
+# qemu — retry for up to 25s.
+mkdir -p /mnt/usb
+mount_data() {
+  mount "$1" /mnt/usb 2>/dev/null || return 1
+  if [ -f /mnt/usb/flashagent.env ] || [ -f /mnt/usb/.env ] || ls /mnt/usb/*.iso >/dev/null 2>&1; then
+    return 0
+  fi
+  umount /mnt/usb 2>/dev/null
+  return 1
+}
+scan_once() {
+  for blk in /sys/class/block/*; do
+    name=$(basename "$blk")
+    case "$name" in loop*|ram*|sr*|zram*|fd*|nvme*ctrl*) continue;; esac
+    case "$name" in nvme*) pref="p";; *) pref="";; esac
+    for pd in /sys/class/block/${name}${pref}* ; do
+      [ -e "$pd/partition" ] || continue
+      if mount_data "/dev/$(basename "$pd")"; then
+        echo "[init] mounted data partition /dev/$(basename "$pd") at /mnt/usb"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+i=0
+until scan_once; do
+  i=$((i+1)); [ $i -ge 13 ] && break
+  echo "[init] waiting for USB data partition... ($i)"
+  sleep 2
+done
+[ -d /mnt/usb/Ventoy ] && echo "[init] Ventoy directory found on stick"
+ls /mnt/usb > /tmp/usb-listing.txt 2>/dev/null
+
+# --- networking (DHCP on first real iface) ---
+# udhcpc hands the lease to /etc/udhcpc/default.script (lowercase env vars:
+# ip, subnet, router, dns) which applies them. We then verify; if the script
+# didn't take effect, apply the IP/route manually from the lease line.
+IF=$(ls /sys/class/net 2>/dev/null | grep -vE '^lo$' | head -1)
+if [ -n "$IF" ]; then
+  ifconfig "$IF" up 2>/dev/null
+  LEASE=$(udhcpc -i "$IF" -s /etc/udhcpc/default.script -n -q -t 10 -T 3 2>&1)
+  if ! ip route 2>/dev/null | grep -q "default via"; then
+    IP=$(printf '%s\n' "$LEASE" | grep -aoE 'lease of [0-9.]+' | grep -aoE '[0-9.]+$' | head -1)
+    GW=$(printf '%s\n' "$LEASE" | grep -aoE 'siaddr: [0-9.]+' | grep -aoE '[0-9.]+$' | head -1)
+    [ -n "$GW" ] || GW=10.0.2.2
+    if [ -n "$IP" ]; then
+      ifconfig "$IF" "$IP" 2>/dev/null
+      route del default 2>/dev/null; route add default "$GW" 2>/dev/null
+      echo "[net] $IF: ip=$IP gw=$GW (manual apply)"
+    fi
+  fi
+  ip route 2>/dev/null
+  [ -f /etc/resolv.conf ] || echo "nameserver 10.0.2.3" > /etc/resolv.conf
+else
+  echo "[init] no network interface found"
+fi
+
+# --- agent config (LLM endpoint + key) ---
+# precedence: /etc/flashagent.env (baked in) > stick /mnt/usb/flashagent.env > env
+# fallback: a copy of ~/.hermes/.env on the stick (HERMES_CUSTOM_*_API_KEY)
+[ -f /etc/flashagent.env ] && . /etc/flashagent.env
+[ -f /mnt/usb/flashagent.env ] && . /mnt/usb/flashagent.env
+# fallback: a copy of ~/.hermes/.env (initrd or stick) with the LLM key var
+for _envf in /mnt/usb/.env /etc/.env; do
+  if [ -z "${LLM_KEY:-}" ] && [ -f "$_envf" ]; then
+    _lk=$(grep -m1 'HERMES_CUSTOM_157_66_255_8_4000_API_KEY' "$_envf" 2>/dev/null \
+          | sed -E 's/^[A-Za-z_]+=//; s/[[:space:]]*$//')
+    [ -n "$_lk" ] && LLM_KEY="$_lk"
+    [ -z "${LLM_BASE:-}" ] && LLM_BASE="http://157.66.255.8:4000/v1"
+    [ -z "${LLM_MODEL:-}" ] && LLM_MODEL="qwen3.8"
+  fi
+done
+export LLM_BASE LLM_KEY LLM_MODEL
+echo "[init] config: key=*** ${LLM_BASE:-none} [${LLM_MODEL:-none}]"
+
+# --- run the agent (it owns the console); if it exits, drop to a shell ---
+# PID 1 must NEVER exit — the kernel panics if it does. Every shell that
+# dies is replaced, so worst case is a stuck prompt, never a panic screen.
+echo "[init] FlashAgent ready (net iface: ${IF:-none})"
+/flashagent
+echo "[init] agent exited (exit=$?) — entering maintenance shell"
+while :; do
+  /bin/sh
+  echo "[init] shell exited (exit=$?) — restarting shell"
+  sleep 1
+done
